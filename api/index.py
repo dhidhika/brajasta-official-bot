@@ -1,24 +1,46 @@
 
 import os
 import secrets
+import logging
 
 from dotenv import load_dotenv
 from fastapi import FastAPI, Request, HTTPException
-from telegram import Bot, Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram import (
+    Bot,
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+)
 from upstash_redis.asyncio import Redis
+
+# =========================
+# KONFIGURASI
+# =========================
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 load_dotenv()
 
 TOKEN = os.getenv("BOT_TOKEN")
-ADMIN_GROUP_ID = int(os.getenv("ADMIN_GROUP_ID", "0"))
+ADMIN_GROUP_ID_RAW = os.getenv("ADMIN_GROUP_ID")
 WEBHOOK_SECRET = os.getenv("TELEGRAM_WEBHOOK_SECRET")
 
-if not TOKEN or not ADMIN_GROUP_ID or not WEBHOOK_SECRET:
+if not TOKEN or not ADMIN_GROUP_ID_RAW or not WEBHOOK_SECRET:
     raise RuntimeError("Environment variables belum lengkap.")
+
+try:
+    ADMIN_GROUP_ID = int(ADMIN_GROUP_ID_RAW)
+except ValueError:
+    raise RuntimeError("ADMIN_GROUP_ID harus berupa angka.")
 
 app = FastAPI()
 
-redis = Redis.from_env()
+try:
+    redis = Redis.from_env()
+except Exception:
+    logger.exception("Gagal menginisialisasi Redis.")
+    raise
 
 
 # =========================
@@ -82,12 +104,14 @@ async def is_admin(bot, user_id):
             user_id=user_id,
         )
         return member.status in ("administrator", "creator")
+
     except Exception:
+        logger.exception("Gagal memeriksa status admin.")
         return False
 
 
 # =========================
-# MEMPROSES PESAN MASUK
+# MEMPROSES PESAN
 # =========================
 
 async def process_message(bot, message):
@@ -99,12 +123,12 @@ async def process_message(bot, message):
     chat = message.chat
     text = message.text or ""
 
-    # Perintah /start hanya di chat pribadi
+    # MENU START
     if chat.type == "private" and text.startswith("/start"):
         await start(bot, chat.id)
         return
 
-    # Perintah /balas hanya di grup admin
+    # BALASAN ADMIN
     if chat.id == ADMIN_GROUP_ID and text.startswith("/balas"):
         if not await is_admin(bot, user.id):
             await bot.send_message(
@@ -116,7 +140,10 @@ async def process_message(bot, message):
         if not message.reply_to_message:
             await bot.send_message(
                 chat_id=chat.id,
-                text="Silakan reply pesan asli dari bot dengan format:\n/balas Isi pesan",
+                text=(
+                    "Silakan reply pesan asli dari bot "
+                    "dengan format:\n/balas Isi pesan"
+                ),
             )
             return
 
@@ -130,6 +157,7 @@ async def process_message(bot, message):
             return
 
         original_id = message.reply_to_message.message_id
+
         target_user = await redis.get(f"message:{original_id}")
 
         if not target_user:
@@ -144,11 +172,15 @@ async def process_message(bot, message):
                 chat_id=int(target_user),
                 text=f"💬 Pesan dari Admin BRAJASTA:\n\n{reply_text}",
             )
+
             await bot.send_message(
                 chat_id=chat.id,
                 text="✅ Balasan berhasil dikirim kepada anggota.",
             )
+
         except Exception:
+            logger.exception("Gagal mengirim balasan admin.")
+
             await bot.send_message(
                 chat_id=chat.id,
                 text="❌ Balasan gagal dikirim kepada anggota.",
@@ -156,21 +188,25 @@ async def process_message(bot, message):
 
         return
 
-    # Abaikan pesan grup selain perintah admin
+    # ABAIKAN PESAN GRUP LAIN
     if chat.type != "private":
         return
 
-    # Hanya menerima pesan teks anggota
+    # ABAIKAN PESAN NON-TEKS DAN COMMAND
     if not text or text.startswith("/"):
         return
 
     user_id = user.id
+
     category = await redis.get(f"choice:{user_id}")
 
     if not category:
         await bot.send_message(
             chat_id=chat.id,
-            text="Silakan pilih layanan terlebih dahulu dengan mengetik /start.",
+            text=(
+                "Silakan pilih layanan terlebih dahulu "
+                "dengan mengetik /start."
+            ),
         )
         return
 
@@ -190,7 +226,11 @@ async def process_message(bot, message):
         text=admin_message,
     )
 
-    await redis.set(f"message:{sent.message_id}", str(user_id))
+    await redis.set(
+        f"message:{sent.message_id}",
+        str(user_id),
+    )
+
     await redis.delete(f"choice:{user_id}")
 
     await bot.send_message(
@@ -207,6 +247,9 @@ async def process_message(bot, message):
 # =========================
 
 async def process_callback(bot, callback):
+    if not callback.message:
+        return
+
     user_id = callback.from_user.id
     chat_id = callback.message.chat.id
 
@@ -220,7 +263,10 @@ async def process_callback(bot, callback):
         return
 
     if callback.data in ("Pengaduan", "Saran", "Pertanyaan"):
-        await redis.set(f"choice:{user_id}", callback.data)
+        await redis.set(
+            f"choice:{user_id}",
+            callback.data,
+        )
 
         await bot.send_message(
             chat_id=chat_id,
@@ -233,27 +279,43 @@ async def process_callback(bot, callback):
 
 
 # =========================
-# WEBHOOK TELEGRAM
+# HALAMAN UTAMA API
 # =========================
 
 @app.get("/")
 async def home():
-    return {"status": "BRAJASTA Official Bot API aktif"}
+    return {
+        "status": "BRAJASTA Official Bot API aktif"
+    }
 
+
+# =========================
+# WEBHOOK TELEGRAM
+# =========================
 
 @app.post("/webhook")
 async def webhook(request: Request):
+
     received_secret = request.headers.get(
-        "X-Telegram-Bot-Api-Secret-Token", ""
+        "X-Telegram-Bot-Api-Secret-Token",
+        "",
     )
 
-    if not secrets.compare_digest(received_secret, WEBHOOK_SECRET):
-        raise HTTPException(status_code=403, detail="Invalid secret")
+    if not secrets.compare_digest(
+        received_secret,
+        WEBHOOK_SECRET,
+    ):
+        logger.warning("Webhook ditolak: secret tidak cocok.")
+        raise HTTPException(
+            status_code=403,
+            detail="Invalid secret",
+        )
 
     try:
         data = await request.json()
 
         async with Bot(TOKEN) as bot:
+
             update = Update.de_json(data, bot)
 
             if update.message:
@@ -266,7 +328,12 @@ async def webhook(request: Request):
 
     except HTTPException:
         raise
+
     except Exception:
+        logger.exception(
+            "Terjadi kesalahan saat memproses webhook Telegram."
+        )
+
         raise HTTPException(
             status_code=500,
             detail="Gagal memproses update Telegram",
